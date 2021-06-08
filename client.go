@@ -1,11 +1,15 @@
 package hedera
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
+
+	"github.com/hashgraph/hedera-sdk-go/proto"
+	"google.golang.org/grpc"
 )
 
 // Default max fees and payments to 1 h-bar
@@ -20,8 +24,14 @@ type Client struct {
 
 	operator *operator
 
-	network       network
-	mirrorNetwork *mirrorNetwork
+	networkNodes   map[AccountID]*node
+	networkNodeIds []AccountID
+}
+
+type node struct {
+	conn    *grpc.ClientConn
+	id      AccountID
+	address string
 }
 
 // TransactionSigner is a closure or function that defines how transactions will be signed
@@ -29,8 +39,8 @@ type TransactionSigner func(message []byte) []byte
 
 type operator struct {
 	accountID  AccountID
-	privateKey *PrivateKey
-	publicKey  PublicKey
+	privateKey *Ed25519PrivateKey
+	publicKey  Ed25519PublicKey
 	signer     TransactionSigner
 }
 
@@ -45,14 +55,6 @@ var mainnetNodes = map[string]AccountID{
 	"35.242.233.154:50211": {Account: 10},
 	"35.240.118.96:50211":  {Account: 11},
 	"35.204.86.32:50211":   {Account: 12},
-	"35.234.132.107:50211": {Account: 13},
-	"35.236.2.27:50211":    {Account: 14},
-	"35.228.11.53:50211":   {Account: 15},
-	"34.91.181.183:50211":  {Account: 16},
-	"34.86.212.247:50211":  {Account: 17},
-	"172.105.247.67:50211": {Account: 18},
-	"34.89.87.138:50211":   {Account: 19},
-	"34.82.78.255:50211":   {Account: 20},
 }
 
 var testnetNodes = map[string]AccountID{
@@ -60,7 +62,6 @@ var testnetNodes = map[string]AccountID{
 	"1.testnet.hedera.com:50211": {Account: 4},
 	"2.testnet.hedera.com:50211": {Account: 5},
 	"3.testnet.hedera.com:50211": {Account: 6},
-	"4.testnet.hedera.com:50211": {Account: 7},
 }
 
 var previewnetNodes = map[string]AccountID{
@@ -68,15 +69,6 @@ var previewnetNodes = map[string]AccountID{
 	"1.previewnet.hedera.com:50211": {Account: 4},
 	"2.previewnet.hedera.com:50211": {Account: 5},
 	"3.previewnet.hedera.com:50211": {Account: 6},
-	"4.previewnet.hedera.com:50211": {Account: 7},
-}
-
-var mainnetMirror = []string{"hcs.mainnet.mirrornode.hedera.com:5600"}
-var testnetMirror = []string{"hcs.testnet.mirrornode.hedera.com:5600"}
-var previewnetMirror = []string{"hcs.previewnet.mirrornode.hedera.com:5600"}
-
-func ClientForNetwork(network map[string]AccountID) *Client {
-	return newClient(network, []string{})
 }
 
 // ClientForMainnet returns a preconfigured client for use with the standard
@@ -84,7 +76,7 @@ func ClientForNetwork(network map[string]AccountID) *Client {
 // Most users will want to set an operator account with .SetOperator so
 // transactions can be automatically given TransactionIDs and signed.
 func ClientForMainnet() *Client {
-	return newClient(mainnetNodes, mainnetMirror)
+	return NewClient(mainnetNodes)
 }
 
 // ClientForTestnet returns a preconfigured client for use with the standard
@@ -92,7 +84,7 @@ func ClientForMainnet() *Client {
 // Most users will want to set an operator account with .SetOperator so
 // transactions can be automatically given TransactionIDs and signed.
 func ClientForTestnet() *Client {
-	return newClient(testnetNodes, testnetMirror)
+	return NewClient(testnetNodes)
 }
 
 // ClientForPreviewnet returns a preconfigured client for use with the standard
@@ -100,36 +92,22 @@ func ClientForTestnet() *Client {
 // Most users will want to set an operator account with .SetOperator so
 // transactions can be automatically given TransactionIDs and signed.
 func ClientForPreviewnet() *Client {
-	return newClient(previewnetNodes, previewnetMirror)
+	return NewClient(previewnetNodes)
 }
 
-// newClient takes in a map of node addresses to their respective IDS (network)
+// NewClient takes in a map of node addresses to their respective IDS (network)
 // and returns a Client instance which can be used to
-func newClient(network map[string]AccountID, mirrorNetwork []string) *Client {
-	client := Client{
+func NewClient(network map[string]AccountID) *Client {
+	client := &Client{
 		maxQueryPayment:   defaultMaxQueryPayment,
 		maxTransactionFee: defaultMaxTransactionFee,
-		network:           newNetwork(),
-		mirrorNetwork:     newMirrorNetwork(),
+		networkNodes:      map[AccountID]*node{},
+		networkNodeIds:    []AccountID{},
 	}
 
-	client.SetNetwork(network)
-	client.SetMirrorNetwork(mirrorNetwork)
+	client.ReplaceNodes(network)
 
-	return &client
-}
-
-func ClientForName(name string) (*Client, error) {
-	switch name {
-	case "testnet":
-		return ClientForTestnet(), nil
-	case "previewnet":
-		return ClientForPreviewnet(), nil
-	case "mainnet":
-		return ClientForMainnet(), nil
-	default:
-		return &Client{}, fmt.Errorf("%q is not recognized as a valid Hedera network", name)
-	}
+	return client
 }
 
 type configOperator struct {
@@ -137,81 +115,77 @@ type configOperator struct {
 	PrivateKey string `json:"privateKey"`
 }
 
-// TODO: Implement complete spec: https://gitlab.com/launchbadge/hedera/sdk/python/-/issues/45
 type clientConfig struct {
-	Network       interface{}     `json:"network"`
-	MirrorNetwork interface{}     `json:"mirrorNetwork"`
-	Operator      *configOperator `json:"operator"`
+	Network  map[string]string `json:"network"`
+	Operator *configOperator   `json:"operator"`
 }
 
-// ClientFromConfig takes in the byte slice representation of a JSON string or
+type clientConfigString struct {
+	Network  string `json:"network"`
+	Operator *configOperator   `json:"operator"`
+}
+
+// ClientFromJSON takes in the byte slice representation of a JSON string or
 // document and returns Client based on the configuration.
-func ClientFromConfig(jsonBytes []byte) (*Client, error) {
+func ClientFromJSON(jsonBytes []byte) (*Client, error) {
+	var clientConfigString clientConfigString
 	var clientConfig clientConfig
+	//var s interface{}
 	var client *Client
+	err := json.Unmarshal(jsonBytes,&clientConfigString)
+	if err != nil{
+		err := json.Unmarshal(jsonBytes,&clientConfig)
+		if err != nil{
+			return nil, err
+		}
+		var network map[string]AccountID =  make(map[string]AccountID)
 
-	err := json.Unmarshal(jsonBytes, &clientConfig)
-	if err != nil {
-		return nil, err
+		for id, url := range clientConfig.Network {
+			accountID, err := AccountIDFromString(id)
+			if err != nil {
+				return nil, err
+			}
+
+			network[url] = accountID
+		}
+
+		client = NewClient(network)
+
+		if clientConfig.Operator == nil {
+			return client, nil
+		}
+
+		operatorID, err := AccountIDFromString(clientConfig.Operator.AccountID)
+		if err != nil {
+			return nil, err
+		}
+
+		operatorKey, err := Ed25519PrivateKeyFromString(clientConfig.Operator.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+
+		operator := operator{
+			accountID:  operatorID,
+			privateKey: &operatorKey,
+			publicKey:  operatorKey.PublicKey(),
+			signer:     operatorKey.Sign,
+		}
+
+		client.operator = &operator
+
+		return client, nil
 	}
+	fmt.Println("in client")
+	fmt.Printf("(%v, %T)\n", clientConfigString, clientConfigString)
 
-	network := make(map[string]AccountID)
-
-	switch net := clientConfig.Network.(type) {
-	case map[string]interface{}:
-		for url, inter := range net {
-			switch id := inter.(type) {
-			case string:
-				accountID, err := AccountIDFromString(id)
-				if err != nil {
-					return client, err
-				}
-
-				network[url] = accountID
-			default:
-				return client, errors.New("network is expected to be map of string to string, or string")
-			}
-		}
-	case string:
-		if len(net) > 0 {
-			switch net {
-			case "mainnet":
-				network = mainnetNodes
-			case "previewnet":
-				network = previewnetNodes
-			case "testnet":
-				network = testnetNodes
-			}
-		}
-	default:
-		return client, errors.New("network is expected to be map of string to string, or string")
-	}
-
-	switch mirror := clientConfig.MirrorNetwork.(type) {
-	case []interface{}:
-		arr := make([]string, len(mirror))
-		for i, inter := range mirror {
-			switch str := inter.(type) {
-			case string:
-				arr[i] = str
-			default:
-				return client, errors.New("mirrorNetwork is expected to be either string or an array of strings")
-			}
-		}
-		client = newClient(network, arr)
-	case string:
-		if len(mirror) > 0 {
-			switch mirror {
-			case "mainnet":
-				client = newClient(network, mainnetMirror)
-			case "previewnet":
-				client = newClient(network, previewnetMirror)
-			case "testnet":
-				client = newClient(network, testnetMirror)
-			}
-		}
-	default:
-		return client, errors.New("mirrorNetwork is expected to be either string or an array of strings")
+	switch clientConfigString.Network{
+		case "mainnet":
+			client = ClientForMainnet()
+		case "testnet":
+			client = ClientForTestnet()
+		case "previewnet":
+			client = ClientForPreviewnet()
 	}
 
 	// if the operator is not provided, finish here
@@ -221,12 +195,12 @@ func ClientFromConfig(jsonBytes []byte) (*Client, error) {
 
 	operatorID, err := AccountIDFromString(clientConfig.Operator.AccountID)
 	if err != nil {
-		return client, err
+		return nil, err
 	}
 
-	operatorKey, err := PrivateKeyFromString(clientConfig.Operator.PrivateKey)
+	operatorKey, err := Ed25519PrivateKeyFromString(clientConfig.Operator.PrivateKey)
 	if err != nil {
-		return client, err
+		return nil, err
 	}
 
 	operator := operator{
@@ -241,9 +215,9 @@ func ClientFromConfig(jsonBytes []byte) (*Client, error) {
 	return client, nil
 }
 
-// ClientFromConfigFile takes a filename string representing the path to a JSON encoded
+// ClientFromFile takes a filename string representing the path to a JSON encoded
 // Client file and returns a Client based on the configuration.
-func ClientFromConfigFile(filename string) (*Client, error) {
+func ClientFromFile(filename string) (*Client, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -258,40 +232,41 @@ func ClientFromConfigFile(filename string) (*Client, error) {
 		return nil, err
 	}
 
-	return ClientFromConfig(configBytes)
+	return ClientFromJSON(configBytes)
 }
 
 // Close is used to disconnect the Client from the network
 func (client *Client) Close() error {
-	client.network.Close()
+	for _, node := range client.networkNodes {
+		if node.conn != nil {
+			err := node.conn.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
 
 	return nil
 }
 
-// SetNetwork replaces all nodes in the Client with a new set of nodes.
+// ReplaceNodes replaces all nodes in the Client with a new set of nodes.
 // (e.g. for an Address Book update).
-func (client *Client) SetNetwork(network map[string]AccountID) error {
-	return client.network.SetNetwork(network)
-}
+func (client *Client) ReplaceNodes(network map[string]AccountID) *Client {
+	for address, id := range network {
+		client.networkNodeIds = append(client.networkNodeIds, id)
+		client.networkNodes[id] = &node{
+			id:      id,
+			address: address,
+		}
+	}
 
-func (client *Client) GetNetwork() map[string]AccountID {
-	return client.network.network
-}
-
-// SetNetwork replaces all nodes in the Client with a new set of nodes.
-// (e.g. for an Address Book update).
-func (client *Client) SetMirrorNetwork(mirrorNetwork []string) {
-	client.mirrorNetwork.setNetwork(mirrorNetwork)
-}
-
-func (client *Client) GetMirrorNetwork() []string {
-	return client.mirrorNetwork.network
+	return client
 }
 
 // SetOperator sets that account that will, by default, be paying for
 // transactions and queries built with the client and the associated key
 // with which to automatically sign transactions.
-func (client *Client) SetOperator(accountID AccountID, privateKey PrivateKey) *Client {
+func (client *Client) SetOperator(accountID AccountID, privateKey Ed25519PrivateKey) *Client {
 	client.operator = &operator{
 		accountID:  accountID,
 		privateKey: &privateKey,
@@ -303,9 +278,9 @@ func (client *Client) SetOperator(accountID AccountID, privateKey PrivateKey) *C
 }
 
 // SetOperatorWith sets that account that will, by default, be paying for
-// transactions and queries built with the client, the account's PublicKey
+// transactions and queries built with the client, the account's Ed25519PublicKey
 // and a callback that will be invoked when a transaction needs to be signed.
-func (client *Client) SetOperatorWith(accountID AccountID, publicKey PublicKey, signer TransactionSigner) *Client {
+func (client *Client) SetOperatorWith(accountID AccountID, publicKey Ed25519PublicKey, signer TransactionSigner) *Client {
 	client.operator = &operator{
 		accountID:  accountID,
 		privateKey: nil,
@@ -316,31 +291,92 @@ func (client *Client) SetOperatorWith(accountID AccountID, publicKey PublicKey, 
 	return client
 }
 
-// GetOperatorAccountID returns the ID for the operator
-func (client *Client) GetOperatorAccountID() AccountID {
-	if client.operator != nil {
-		return client.operator.accountID
-	} else {
-		return AccountID{}
-	}
+// GetOperatorID returns the ID for the operator
+func (client *Client) GetOperatorID() AccountID {
+	return client.operator.accountID
 }
 
-// GetOperatorPublicKey returns the Key for the operator
-func (client *Client) GetOperatorPublicKey() PublicKey {
-	if client.operator != nil {
-		return client.operator.publicKey
-	} else {
-		return PublicKey{}
-	}
+// GetOperatorKey returns the Key for the operator
+func (client *Client) GetOperatorKey() Ed25519PublicKey {
+	return client.operator.publicKey
+}
+
+// SetMaxTransactionFee sets the maximum fee to be paid for the transactions
+// executed by the Client.
+// Because transaction fees are always maximums the actual fee assessed for
+// a given transaction may be less than this value, but never greater.
+func (client *Client) SetMaxTransactionFee(fee Hbar) *Client {
+	client.maxTransactionFee = fee
+	return client
+}
+
+// SetMaxQueryPayment sets the default maximum payment allowable for queries.
+func (client *Client) SetMaxQueryPayment(payment Hbar) *Client {
+	client.maxQueryPayment = payment
+	return client
 }
 
 // Ping sends an AccountBalanceQuery to the specified node returning nil if no
 // problems occur. Otherwise, an error representing the status of the node will
 // be returned.
 func (client *Client) Ping(nodeID AccountID) error {
-	_, err := NewAccountBalanceQuery().
-		SetAccountID(client.GetOperatorAccountID()).
-		SetNodeAccountIDs([]AccountID{nodeID}).
-		Execute(client)
-	return err
+	node := client.networkNodes[nodeID]
+	if node == nil {
+		return fmt.Errorf("node with ID %s not registered on this client", nodeID)
+	}
+
+	pingQuery := NewAccountBalanceQuery().
+		SetAccountID(nodeID)
+
+	pb := pingQuery.QueryBuilder.pb
+
+	resp := new(proto.Response)
+
+	err := node.invoke(methodName(pb), pb, resp)
+
+	if err != nil {
+		return newErrPingStatus(err)
+	}
+
+	respHeader := mapResponseHeader(resp)
+
+	if respHeader.NodeTransactionPrecheckCode == proto.ResponseCodeEnum_BUSY {
+		return newErrPingStatus(fmt.Errorf("%s", Status(respHeader.NodeTransactionPrecheckCode).String()))
+	}
+
+	if isResponseUnknown(resp) {
+		return newErrPingStatus(fmt.Errorf("unknown"))
+	}
+
+	return nil
+}
+
+func (client *Client) randomNode() *node {
+	nodeIndex := rand.Intn(len(client.networkNodeIds))
+	nodeID := client.networkNodeIds[nodeIndex]
+
+	return client.networkNodes[nodeID]
+}
+
+func (client *Client) node(id AccountID) *node {
+	return client.networkNodes[id]
+}
+
+func (node *node) invoke(method string, in interface{}, out interface{}) error {
+	if node.conn == nil {
+		conn, err := grpc.Dial(node.address, grpc.WithInsecure())
+		if err != nil {
+			return newErrHederaNetwork(err)
+		}
+
+		node.conn = conn
+	}
+
+	err := node.conn.Invoke(context.TODO(), method, in, out)
+
+	if err != nil {
+		return newErrHederaNetwork(err)
+	}
+
+	return nil
 }
